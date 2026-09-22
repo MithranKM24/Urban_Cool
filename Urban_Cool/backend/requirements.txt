@@ -1,0 +1,9 @@
+fastapi
+numpy
+pandas
+scipy
+rasterio
+geopandas
+shapely
+scikit-learn
+catboost
