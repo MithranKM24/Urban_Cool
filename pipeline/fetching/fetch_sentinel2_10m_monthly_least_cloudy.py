@@ -12,9 +12,10 @@ from pipeline.common import study_area
 from pipeline.common import thresholds
 from pipeline.common import sentinel2_composite
 from pipeline.common import tiled_download
+from pipeline.common.paths import RAW_DATA_DIR, VALIDATED_DATA_DIR
 
-output_folder_for_raw_data = os.path.join("D:\\", "Projects", "UC", "data", "raw", "sentinel2_10m_monthly_least_cloudy")
-output_folder_for_validated_data = os.path.join("D:\\", "Projects", "UC", "data", "validated", "sentinel2_10m_monthly_least_cloudy")
+output_folder_for_raw_data = os.path.join(RAW_DATA_DIR, "sentinel2_10m_monthly_least_cloudy")
+output_folder_for_validated_data = os.path.join(VALIDATED_DATA_DIR, "sentinel2_10m_monthly_least_cloudy")
 monthly_log_csv_path = os.path.join(output_folder_for_raw_data, "monthly_least_cloudy_log.csv")
 
 requested_start_year = 2021

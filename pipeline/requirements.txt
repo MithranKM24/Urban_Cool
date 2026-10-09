@@ -1,0 +1,8 @@
+earthengine-api
+geopandas
+numpy
+pandas
+rasterio
+requests
+scikit-learn
+shapely

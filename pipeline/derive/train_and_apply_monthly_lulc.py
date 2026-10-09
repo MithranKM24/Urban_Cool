@@ -16,9 +16,10 @@ from pipeline.common import study_area
 from pipeline.common import thresholds
 from pipeline.common import osm_reference
 from pipeline.common import sentinel2_composite
+from pipeline.common.paths import VALIDATED_DATA_DIR
 
-source_monthly_bands_folder = os.path.join("D:\\", "Projects", "UC", "data", "validated", "sentinel2_10m_monthly_least_cloudy")
-output_folder_for_validated_data = os.path.join("D:\\", "Projects", "UC", "data", "validated", "lulc_10m_monthly")
+source_monthly_bands_folder = os.path.join(VALIDATED_DATA_DIR, "sentinel2_10m_monthly_least_cloudy")
+output_folder_for_validated_data = os.path.join(VALIDATED_DATA_DIR, "lulc_10m_monthly")
 
 classification_band_names = ["B2", "B3", "B4", "B8"]
 points_to_sample_per_class = 150
