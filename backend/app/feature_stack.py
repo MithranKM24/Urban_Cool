@@ -4,6 +4,8 @@ import time
 import numpy as np
 import rasterio
 import rasterio.features
+import rasterio.windows
+from rasterio.windows import Window
 from rasterio.enums import MergeAlg
 import geopandas as gpd
 from scipy.ndimage import uniform_filter
@@ -131,8 +133,20 @@ def percent(count, total):
     return np.where(total > 0, count / np.maximum(total, 1) * 100.0, np.nan)
 
 
-def build_feature_stack(rebuild=False):
-    if os.path.exists(CACHE_PATH) and not rebuild:
+def build_feature_stack(rebuild=False, window=None, padded=False):
+    if window is not None and not padded:
+        pad = WINDOW // 2
+        r0, c0 = max(window[0] - pad, 0), max(window[1] - pad, 0)
+        r1, c1 = window[0] + window[2] + pad, window[1] + window[3] + pad
+        big, meta = build_feature_stack(window=(r0, c0, r1 - r0, c1 - c0), padded=True)
+        top, left = window[0] - r0, window[1] - c0
+        out = {}
+        for f in big:
+            out[f] = big[f][top:top + window[2], left:left + window[3]]
+        meta["height"], meta["width"] = window[2], window[3]
+        meta["transform"] = list(rasterio.Affine(*meta["transform"]) * rasterio.Affine.translation(left, top))[:6]
+        return out, meta
+    if window is None and os.path.exists(CACHE_PATH) and not rebuild:
         print("Loading saved features from", CACHE_PATH)
         saved = np.load(CACHE_PATH, allow_pickle=True)
         features = {}
@@ -142,6 +156,11 @@ def build_feature_stack(rebuild=False):
 
     print("Building the features from all months, this takes a while...")
     transform, shape, crs = get_grid()
+    win = None
+    if window is not None:
+        win = Window(window[1], window[0], window[3], window[2])
+        transform = rasterio.windows.transform(win, transform)
+        shape = (window[2], window[3])
     height, width = shape
     months = find_months()
     print("Grid:", width, "x", height, "pixels, months found:", len(months))
@@ -168,13 +187,13 @@ def build_feature_stack(rebuild=False):
     for m in range(len(months)):
         month = months[m]
         with rasterio.open(month["ndvi"]) as f:
-            ndvi_now = f.read(1).astype(np.float64)
+            ndvi_now = f.read(1, window=win).astype(np.float64)
         with rasterio.open(month["ndwi"]) as f:
-            ndwi_now = f.read(1).astype(np.float64)
+            ndwi_now = f.read(1, window=win).astype(np.float64)
         with rasterio.open(month["lulc"]) as f:
-            lulc = f.read(1)
+            lulc = f.read(1, window=win)
         with rasterio.open(month["bands"]) as f:
-            bands = f.read()
+            bands = f.read(window=win)
 
         ndvi.add(ndvi_now, ~np.isnan(ndvi_now))
         ndwi.add(ndwi_now, ~np.isnan(ndwi_now))
@@ -234,6 +253,8 @@ def build_feature_stack(rebuild=False):
     features["road_density_km_per_km2"] = road_density(transform, shape, crs)
 
     meta = {"height": height, "width": width, "transform": list(transform)[:6], "crs": str(crs), "n_months": len(months)}
+    if window is not None:
+        return features, meta
     os.makedirs(CACHE_DIR, exist_ok=True)
     np.savez_compressed(CACHE_PATH, meta_shape=np.array(list(meta.items()), dtype=object), **features)
     print("Saved the features to", CACHE_PATH)
