@@ -6,9 +6,9 @@ interface CaveatBannerProps {
 
 export default function CaveatBanner({ caveat }: CaveatBannerProps) {
   return (
-    <div className="flex items-center gap-2 px-6 py-2 bg-[#3a3227] border-t border-[#2a241c] z-30">
-      <AlertTriangle size={15} className="text-[#e8c46a] shrink-0" />
-      <span className="text-xs text-[#e9e4d8] leading-snug">{caveat}</span>
+    <div className="flex items-start gap-2 border-t border-[#dfe4de] py-3 text-[#7a837b]">
+      <AlertTriangle size={15} className="mt-0.5 shrink-0 text-[#c18a51]" />
+      <span className="text-xs leading-5">{caveat}</span>
     </div>
   );
 }

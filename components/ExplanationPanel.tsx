@@ -11,8 +11,8 @@ interface ExplanationPanelProps {
 export default function ExplanationPanel({ shapSummary, plainLanguageSummary, isLoading }: ExplanationPanelProps) {
   return (
     <div>
-      <div className="text-[11px] font-semibold uppercase tracking-wide text-[#a09a89] mb-2">Why this score</div>
-      <div className="text-[13px] leading-relaxed text-[#2c2a24] px-3 py-2.5 bg-[#faf5ee] rounded-md">
+      <div className="mb-2 text-sm font-medium text-[#5d6c61]">What is driving it?</div>
+      <div className="text-sm leading-6 text-[#59665d]">
         {isLoading
           ? "Analyzing region..."
           : plainLanguageSummary ?? "Draw a region on the map to see which factors drive its heat vulnerability score."}
@@ -20,7 +20,7 @@ export default function ExplanationPanel({ shapSummary, plainLanguageSummary, is
       {shapSummary && shapSummary.length > 0 && (
         <div className="mt-2.5 flex flex-col gap-1">
           {shapSummary.slice(0, 4).map((c) => (
-            <div key={c.feature} className="flex items-center justify-between text-[11px] text-[#6b6656]">
+            <div key={c.feature} className="flex items-center justify-between text-sm text-[#6b6656]">
               <span>{getMetricLabelSafe(c.feature)}</span>
               <span className="font-mono" style={{ color: c.mean_shap_value >= 0 ? "#b45f42" : "#2f7d5e" }}>
                 {c.mean_shap_value >= 0 ? "+" : ""}
