@@ -1,60 +1,57 @@
 import numpy as np
 import pandas as pd
 
-MAX_POINTS = 800000
+MAX_UNAGGREGATED_PIXELS = 800000
 
 
-def pixel_to_lonlat(transform, rows, cols):
-    rows = np.asarray(rows, dtype=np.float64) + 0.5
-    cols = np.asarray(cols, dtype=np.float64) + 0.5
-    lon = transform.a * cols + transform.b * rows + transform.c
-    lat = transform.d * cols + transform.e * rows + transform.f
+def affine_pixel_centers_to_lonlat(transform, rows, cols):
+    rows_c = np.asarray(rows, dtype=np.float64) + 0.5
+    cols_c = np.asarray(cols, dtype=np.float64) + 0.5
+    lon = transform.a * cols_c + transform.b * rows_c + transform.c
+    lat = transform.d * cols_c + transform.e * rows_c + transform.f
     return lon, lat
 
 
-def make_grid(rows, cols, transform, values, max_points=MAX_POINTS):
-    rows = np.asarray(rows)
-    cols = np.asarray(cols)
-    n = len(rows)
-    names = list(values.keys())
-
-    aggregated = n > max_points
-    cell_size = 10.0
+def build_grid_geojson(row_indices, col_indices, transform, metric_arrays_by_name, max_features=MAX_UNAGGREGATED_PIXELS):
+    row_indices = np.asarray(row_indices)
+    col_indices = np.asarray(col_indices)
+    n_pixels = len(row_indices)
+    aggregated = n_pixels > max_features
+    cell_size_meters = 10.0
+    names = list(metric_arrays_by_name.keys())
 
     if aggregated:
-        factor = int(np.ceil(np.sqrt(n / max_points)))
-        cell_size = 10.0 * factor
-
-        df = pd.DataFrame({"block_row": rows // factor, "block_col": cols // factor})
+        aggregation_factor = int(np.ceil(np.sqrt(n_pixels / max_features)))
+        cell_size_meters = 10.0 * aggregation_factor
+        agg_row = row_indices // aggregation_factor
+        agg_col = col_indices // aggregation_factor
+        df = pd.DataFrame({"key_row": agg_row, "key_col": agg_col})
         for name in names:
-            df[name] = values[name]
-        blocks = df.groupby(["block_row", "block_col"], as_index=False).mean()
-
-        center_row = blocks["block_row"].to_numpy() * factor + factor / 2.0
-        center_col = blocks["block_col"].to_numpy() * factor + factor / 2.0
-        lon, lat = pixel_to_lonlat(transform, center_row, center_col)
-        columns = [blocks[name].to_numpy() for name in names]
+            df[name] = metric_arrays_by_name[name]
+        grouped = df.groupby(["key_row", "key_col"], as_index=False).mean()
+        center_row = grouped["key_row"].to_numpy() * aggregation_factor + aggregation_factor / 2.0
+        center_col = grouped["key_col"].to_numpy() * aggregation_factor + aggregation_factor / 2.0
+        lon_arr, lat_arr = affine_pixel_centers_to_lonlat(transform, center_row, center_col)
+        value_columns = [grouped[name].to_numpy() for name in names]
     else:
-        lon, lat = pixel_to_lonlat(transform, rows, cols)
-        columns = [np.asarray(values[name], dtype=np.float64) for name in names]
+        lon_arr, lat_arr = affine_pixel_centers_to_lonlat(transform, row_indices, col_indices)
+        value_columns = [np.asarray(metric_arrays_by_name[name], dtype=np.float64) for name in names]
 
-    keep = np.ones(len(lon), dtype=bool)
-    for c in columns:
-        keep = keep & ~pd.isna(c)
+    valid_mask = np.ones(len(lon_arr), dtype=bool)
+    for col in value_columns:
+        valid_mask &= ~pd.isna(col)
 
-    lon = np.round(lon[keep], 6).tolist()
-    lat = np.round(lat[keep], 6).tolist()
-    columns = [np.round(c[keep], 4).tolist() for c in columns]
+    lon_list = np.round(lon_arr[valid_mask], 6).tolist()
+    lat_list = np.round(lat_arr[valid_mask], 6).tolist()
+    value_lists = [np.round(col[valid_mask], 4).tolist() for col in value_columns]
 
     features = []
-    for i in range(len(lon)):
-        props = {}
-        for j in range(len(names)):
-            props[names[j]] = columns[j][i]
+    for i in range(len(lon_list)):
+        props = {names[j]: value_lists[j][i] for j in range(len(names))}
         features.append({
             "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [lon[i], lat[i]]},
+            "geometry": {"type": "Point", "coordinates": [lon_list[i], lat_list[i]]},
             "properties": props,
         })
 
-    return {"type": "FeatureCollection", "features": features}, aggregated, cell_size
+    return {"type": "FeatureCollection", "features": features}, aggregated, cell_size_meters

@@ -4,35 +4,33 @@ import time
 import numpy as np
 import rasterio
 import rasterio.features
-import rasterio.windows
-from rasterio.windows import Window
-from rasterio.enums import MergeAlg
 import geopandas as gpd
 from scipy.ndimage import uniform_filter
 
-from app.albedo import get_albedo
+from app.albedo import compute_albedo_from_raw_bands, ALBEDO_METHOD_METADATA
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-DATA_DIR = os.path.join(ROOT, "data", "validated")
-CACHE_DIR = os.path.join(ROOT, "backend", "cache")
-CACHE_PATH = os.path.join(CACHE_DIR, "feature_stack_10m.npz")
+DATA_DIR = os.path.join(PROJECT_ROOT, "data", "validated")
+CACHE_DIR = os.path.join(PROJECT_ROOT, "backend", "cache")
 
-BANDS_DIR = os.path.join(DATA_DIR, "sentinel2_10m_monthly_least_cloudy")
+SENTINEL2_BANDS_DIR = os.path.join(DATA_DIR, "sentinel2_10m_monthly_least_cloudy")
 NDVI_DIR = os.path.join(DATA_DIR, "ndvi_10m_monthly")
 NDWI_DIR = os.path.join(DATA_DIR, "water_ndwi_10m_monthly")
 LULC_DIR = os.path.join(DATA_DIR, "lulc_10m_monthly")
 BUILDINGS_PATH = os.path.join(DATA_DIR, "building_footprints", "building_footprints.geojson")
 ROADS_PATH = os.path.join(DATA_DIR, "road_network", "road_network.geojson")
 
-BUILT_UP = 0
-VEGETATION = 1
-WATER = 2
-NO_DATA = 255
+LULC_BUILT_UP_CODE = 0
+LULC_VEGETATION_CODE = 1
+LULC_WATER_CODE = 2
+LULC_NODATA_CODE = 255
 
-WINDOW = 9
-PIXEL = 10.0
+BUILDING_DENSITY_WINDOW_PIXELS = 9
+ROAD_DENSITY_WINDOW_PIXELS = 9
+PIXEL_SIZE_METERS = 10.0
 
+FEATURE_STACK_CACHE_PATH = os.path.join(CACHE_DIR, "feature_stack_10m.npz")
 FEATURE_NAMES = [
     "ndvi_mean", "ndvi_min", "ndvi_std",
     "ndwi_mean", "ndwi_std",
@@ -44,219 +42,220 @@ FEATURE_NAMES = [
 ]
 
 
-class Stats:
-    def __init__(self, shape, keep_min):
-        self.total = np.zeros(shape, dtype=np.float64)
-        self.squares = np.zeros(shape, dtype=np.float64)
-        self.count = np.zeros(shape, dtype=np.int32)
-        self.smallest = None
-        if keep_min:
-            self.smallest = np.full(shape, np.inf, dtype=np.float64)
-
-    def add(self, values, valid):
-        v = values[valid]
-        self.total[valid] += v
-        self.squares[valid] += v ** 2
-        if self.smallest is not None:
-            self.smallest[valid] = np.minimum(self.smallest[valid], v)
-        self.count[valid] += 1
-
-    def mean(self):
-        return np.where(self.count > 0, self.total / np.maximum(self.count, 1), np.nan)
-
-    def std(self, mean):
-        variance = np.where(self.count > 0, self.squares / np.maximum(self.count, 1) - mean ** 2, np.nan)
-        return np.sqrt(np.maximum(variance, 0))
-
-    def min(self):
-        return np.where(self.count > 0, self.smallest, np.nan)
+def log(msg):
+    print(f"[feature_stack] {msg}", flush=True)
 
 
-def find_months():
+def list_available_months():
+    ndvi_files = sorted(glob.glob(os.path.join(NDVI_DIR, "*.tif")))
     months = []
-    for ndvi_file in sorted(glob.glob(os.path.join(NDVI_DIR, "*.tif"))):
-        name = os.path.basename(ndvi_file).replace("ndvi_10m_", "").replace(".tif", "")
-        bands = os.path.join(BANDS_DIR, name, "sentinel2_10m_least_cloudy_" + name + ".tif")
-        ndwi = os.path.join(NDWI_DIR, "ndwi_10m_" + name + ".tif")
-        lulc = os.path.join(LULC_DIR, name, "lulc_10m_" + name + ".tif")
-        if os.path.exists(bands) and os.path.exists(ndwi) and os.path.exists(lulc):
-            months.append({"name": name, "bands": bands, "ndvi": ndvi_file, "ndwi": ndwi, "lulc": lulc})
-    return sorted(months, key=lambda m: m["name"])
+    for f in ndvi_files:
+        year_month = os.path.basename(f).replace("ndvi_10m_", "").replace(".tif", "")
+        band_file = os.path.join(SENTINEL2_BANDS_DIR, year_month, f"sentinel2_10m_least_cloudy_{year_month}.tif")
+        ndwi_file = os.path.join(NDWI_DIR, f"ndwi_10m_{year_month}.tif")
+        lulc_file = os.path.join(LULC_DIR, year_month, f"lulc_10m_{year_month}.tif")
+        if os.path.exists(band_file) and os.path.exists(ndwi_file) and os.path.exists(lulc_file):
+            months.append({"year_month": year_month, "bands": band_file, "ndvi": f, "ndwi": ndwi_file, "lulc": lulc_file})
+    return sorted(months, key=lambda m: m["year_month"])
 
 
-def get_grid():
-    first = sorted(glob.glob(os.path.join(NDVI_DIR, "*.tif")))[0]
-    with rasterio.open(first) as f:
-        return f.transform, (f.height, f.width), f.crs
+def get_reference_grid():
+    reference_file = sorted(glob.glob(os.path.join(NDVI_DIR, "*.tif")))[0]
+    with rasterio.open(reference_file) as ds:
+        return ds.transform, (ds.height, ds.width), ds.crs, ds.bounds
 
 
-def building_density(transform, shape, crs):
-    print("Building density...")
+def rasterize_building_density(transform, shape, crs):
+    log(f"Rasterizing building footprints to the native 10m grid, then applying a {BUILDING_DENSITY_WINDOW_PIXELS}x{BUILDING_DENSITY_WINDOW_PIXELS}-pixel moving-window density estimate ...")
     buildings = gpd.read_file(BUILDINGS_PATH)
     buildings = buildings[buildings.geometry.is_valid]
-    centers = buildings.to_crs(crs).geometry.centroid
+    buildings_wgs84 = buildings.to_crs(crs)
+    centroids = buildings_wgs84.geometry.centroid
 
-    points = rasterio.features.rasterize(
-        [(c, 1) for c in centers],
-        out_shape=shape, transform=transform, fill=0, dtype="float32", merge_alg=MergeAlg.add,
+    point_raster = rasterio.features.rasterize(
+        [(geom, 1) for geom in centroids],
+        out_shape=shape, transform=transform, fill=0, dtype="float32", merge_alg=rasterio.enums.MergeAlg.add,
     )
-    count = uniform_filter(points, size=WINDOW, mode="constant") * (WINDOW ** 2)
-    area_km2 = ((WINDOW * PIXEL) ** 2) / 1e6
-    density = count / area_km2
+    log(f"Rasterized {int(point_raster.sum())} building centroids onto the 10m grid (of {len(buildings_wgs84)} total buildings).")
 
-    print("Buildings per km2, min:", round(float(density.min()), 1), "mean:", round(float(density.mean()), 1), "max:", round(float(density.max()), 1))
-    return density.astype(np.float32)
+    window_building_count = uniform_filter(point_raster, size=BUILDING_DENSITY_WINDOW_PIXELS, mode="constant") * (BUILDING_DENSITY_WINDOW_PIXELS ** 2)
+    window_area_km2 = ((BUILDING_DENSITY_WINDOW_PIXELS * PIXEL_SIZE_METERS) ** 2) / 1e6
+    building_density_per_km2 = window_building_count / window_area_km2
+
+    log(f"Building density per km2: min={building_density_per_km2.min():.1f}, mean={building_density_per_km2.mean():.1f}, max={building_density_per_km2.max():.1f}")
+    return building_density_per_km2.astype(np.float32)
 
 
-def road_density(transform, shape, crs):
-    print("Road density...")
+def rasterize_road_density(transform, shape, crs):
+    log(f"Rasterizing roads to the native 10m grid (presence mask, all_touched), then applying a {ROAD_DENSITY_WINDOW_PIXELS}x{ROAD_DENSITY_WINDOW_PIXELS}-pixel moving-window density approximation ...")
+    log("Honesty note: this is a presence-based approximation (fraction of window pixels a road touches, scaled by pixel size), not an exact vector-length-per-km2 calculation like the zonal model used.")
     roads = gpd.read_file(ROADS_PATH)
     roads = roads[roads.geometry.is_valid]
-    lines = roads.to_crs(crs).geometry
+    roads_wgs84 = roads.to_crs(crs)
 
-    touched = rasterio.features.rasterize(
-        [(line, 1) for line in lines],
+    presence_raster = rasterio.features.rasterize(
+        [(geom, 1) for geom in roads_wgs84.geometry],
         out_shape=shape, transform=transform, fill=0, dtype="uint8", all_touched=True,
     )
-    fraction = uniform_filter(touched.astype(np.float32), size=WINDOW, mode="constant")
+    log(f"Road-presence pixels: {int(presence_raster.sum())} of {presence_raster.size} total.")
 
-    pixels = fraction * (WINDOW ** 2)
-    length_km = pixels * (PIXEL / 1000.0)
-    area_km2 = (WINDOW * PIXEL / 1000.0) ** 2
-    density = length_km / area_km2
+    window_presence_fraction = uniform_filter(presence_raster.astype(np.float32), size=ROAD_DENSITY_WINDOW_PIXELS, mode="constant")
+    window_side_km = (ROAD_DENSITY_WINDOW_PIXELS * PIXEL_SIZE_METERS) / 1000.0
+    window_area_km2 = window_side_km ** 2
+    touched_pixel_count = window_presence_fraction * (ROAD_DENSITY_WINDOW_PIXELS ** 2)
+    length_km_in_window = touched_pixel_count * (PIXEL_SIZE_METERS / 1000.0)
+    road_density_km_per_km2 = length_km_in_window / window_area_km2
 
-    print("Road km per km2, min:", round(float(density.min()), 2), "mean:", round(float(density.mean()), 2), "max:", round(float(density.max()), 2))
-    return density.astype(np.float32)
-
-
-def percent(count, total):
-    return np.where(total > 0, count / np.maximum(total, 1) * 100.0, np.nan)
+    log(f"Road density (approx) km/km2: min={road_density_km_per_km2.min():.2f}, mean={road_density_km_per_km2.mean():.2f}, max={road_density_km_per_km2.max():.2f}")
+    return road_density_km_per_km2.astype(np.float32)
 
 
-def build_feature_stack(rebuild=False, window=None, padded=False):
-    if window is not None and not padded:
-        pad = WINDOW // 2
-        r0, c0 = max(window[0] - pad, 0), max(window[1] - pad, 0)
-        r1, c1 = window[0] + window[2] + pad, window[1] + window[3] + pad
-        big, meta = build_feature_stack(window=(r0, c0, r1 - r0, c1 - c0), padded=True)
-        top, left = window[0] - r0, window[1] - c0
-        out = {}
-        for f in big:
-            out[f] = big[f][top:top + window[2], left:left + window[3]]
-        meta["height"], meta["width"] = window[2], window[3]
-        meta["transform"] = list(rasterio.Affine(*meta["transform"]) * rasterio.Affine.translation(left, top))[:6]
-        return out, meta
-    if window is None and os.path.exists(CACHE_PATH) and not rebuild:
-        print("Loading saved features from", CACHE_PATH)
-        saved = np.load(CACHE_PATH, allow_pickle=True)
-        features = {}
-        for f in FEATURE_NAMES:
-            features[f] = saved[f]
-        return features, dict(saved["meta_shape"])
+def build_feature_stack(force_rebuild=False):
+    if os.path.exists(FEATURE_STACK_CACHE_PATH) and not force_rebuild:
+        log(f"Cached feature stack found at {FEATURE_STACK_CACHE_PATH}, loading instead of recomputing.")
+        cached = np.load(FEATURE_STACK_CACHE_PATH, allow_pickle=True)
+        return {name: cached[name] for name in FEATURE_NAMES}, dict(cached["meta_shape"])
 
-    print("Building the features from all months, this takes a while...")
-    transform, shape, crs = get_grid()
-    win = None
-    if window is not None:
-        win = Window(window[1], window[0], window[3], window[2])
-        transform = rasterio.windows.transform(win, transform)
-        shape = (window[2], window[3])
+    log("=====================================================")
+    log("BUILDING NATIVE-10m PIXEL FEATURE STACK (full AOI, single streaming pass over months)")
+    log("=====================================================")
+
+    transform, shape, crs, bounds = get_reference_grid()
     height, width = shape
-    months = find_months()
-    print("Grid:", width, "x", height, "pixels, months found:", len(months))
+    total_pixels = height * width
+    log(f"Grid: {width} x {height} = {total_pixels} pixels at 10m native resolution, CRS {crs}")
 
-    ndvi = Stats(shape, True)
-    ndwi = Stats(shape, False)
-    albedo = Stats(shape, True)
+    months = list_available_months()
+    log(f"Months with a complete set of bands+NDVI+NDWI+LULC: {len(months)}")
+
+    ndvi_sum = np.zeros(shape, dtype=np.float64)
+    ndvi_sumsq = np.zeros(shape, dtype=np.float64)
+    ndvi_min = np.full(shape, np.inf, dtype=np.float64)
+    ndvi_count = np.zeros(shape, dtype=np.int32)
+
+    ndwi_sum = np.zeros(shape, dtype=np.float64)
+    ndwi_sumsq = np.zeros(shape, dtype=np.float64)
+    ndwi_count = np.zeros(shape, dtype=np.int32)
+
+    albedo_sum = np.zeros(shape, dtype=np.float64)
+    albedo_sumsq = np.zeros(shape, dtype=np.float64)
+    albedo_min = np.full(shape, np.inf, dtype=np.float64)
+    albedo_count = np.zeros(shape, dtype=np.int32)
 
     built_up_count = np.zeros(shape, dtype=np.int32)
     vegetation_count = np.zeros(shape, dtype=np.int32)
     water_count = np.zeros(shape, dtype=np.int32)
-    lulc_count = np.zeros(shape, dtype=np.int32)
+    lulc_valid_count = np.zeros(shape, dtype=np.int32)
 
-    sum_t = np.zeros(shape, dtype=np.float64)
-    sum_y = np.zeros(shape, dtype=np.float64)
-    sum_ty = np.zeros(shape, dtype=np.float64)
-    sum_tt = np.zeros(shape, dtype=np.float64)
+    trend_sum_t = np.zeros(shape, dtype=np.float64)
+    trend_sum_y = np.zeros(shape, dtype=np.float64)
+    trend_sum_ty = np.zeros(shape, dtype=np.float64)
+    trend_sum_tt = np.zeros(shape, dtype=np.float64)
     trend_n = np.zeros(shape, dtype=np.int32)
 
-    below = 0
-    above = 0
-    start = time.time()
+    total_clipped_below = 0
+    total_clipped_above = 0
 
-    for m in range(len(months)):
-        month = months[m]
-        with rasterio.open(month["ndvi"]) as f:
-            ndvi_now = f.read(1, window=win).astype(np.float64)
-        with rasterio.open(month["ndwi"]) as f:
-            ndwi_now = f.read(1, window=win).astype(np.float64)
-        with rasterio.open(month["lulc"]) as f:
-            lulc = f.read(1, window=win)
-        with rasterio.open(month["bands"]) as f:
-            bands = f.read(window=win)
+    start_time = time.time()
+    for month_index, month in enumerate(months):
+        with rasterio.open(month["ndvi"]) as ds:
+            ndvi_arr = ds.read(1).astype(np.float64)
+        with rasterio.open(month["ndwi"]) as ds:
+            ndwi_arr = ds.read(1).astype(np.float64)
+        with rasterio.open(month["lulc"]) as ds:
+            lulc_arr = ds.read(1)
+        with rasterio.open(month["bands"]) as ds:
+            raw_bands = ds.read()
 
-        ndvi.add(ndvi_now, ~np.isnan(ndvi_now))
-        ndwi.add(ndwi_now, ~np.isnan(ndwi_now))
+        ndvi_valid = ~np.isnan(ndvi_arr)
+        ndvi_sum[ndvi_valid] += ndvi_arr[ndvi_valid]
+        ndvi_sumsq[ndvi_valid] += ndvi_arr[ndvi_valid] ** 2
+        ndvi_min[ndvi_valid] = np.minimum(ndvi_min[ndvi_valid], ndvi_arr[ndvi_valid])
+        ndvi_count[ndvi_valid] += 1
 
-        albedo_now, low, high = get_albedo(bands[0], bands[2], bands[3])
-        below += low
-        above += high
-        albedo.add(albedo_now, np.any(bands != 0, axis=0))
+        ndwi_valid = ~np.isnan(ndwi_arr)
+        ndwi_sum[ndwi_valid] += ndwi_arr[ndwi_valid]
+        ndwi_sumsq[ndwi_valid] += ndwi_arr[ndwi_valid] ** 2
+        ndwi_count[ndwi_valid] += 1
 
-        valid = lulc != NO_DATA
-        is_built_up = lulc == BUILT_UP
-        lulc_count[valid] += 1
-        built_up_count[valid & is_built_up] += 1
-        vegetation_count[valid & (lulc == VEGETATION)] += 1
-        water_count[valid & (lulc == WATER)] += 1
+        albedo_arr, validation_report = compute_albedo_from_raw_bands(raw_bands[0], raw_bands[2], raw_bands[3])
+        albedo_valid = np.any(raw_bands != 0, axis=0)
+        total_clipped_below += validation_report["pixels_clipped_below_zero"]
+        total_clipped_above += validation_report["pixels_clipped_above_one"]
+        albedo_sum[albedo_valid] += albedo_arr[albedo_valid]
+        albedo_sumsq[albedo_valid] += albedo_arr[albedo_valid] ** 2
+        albedo_min[albedo_valid] = np.minimum(albedo_min[albedo_valid], albedo_arr[albedo_valid])
+        albedo_count[albedo_valid] += 1
 
-        y = np.where(valid, is_built_up.astype(np.float64), 0.0)
-        t = float(m)
-        sum_t[valid] += t
-        sum_y[valid] += y[valid]
-        sum_ty[valid] += t * y[valid]
-        sum_tt[valid] += t * t
-        trend_n[valid] += 1
+        lulc_valid = lulc_arr != LULC_NODATA_CODE
+        lulc_valid_count[lulc_valid] += 1
+        is_built_up = lulc_arr == LULC_BUILT_UP_CODE
+        built_up_count[lulc_valid & is_built_up] += 1
+        vegetation_count[lulc_valid & (lulc_arr == LULC_VEGETATION_CODE)] += 1
+        water_count[lulc_valid & (lulc_arr == LULC_WATER_CODE)] += 1
 
-        print("Month", m + 1, "of", len(months), month["name"], round(time.time() - start, 1), "seconds")
+        y = np.where(lulc_valid, is_built_up.astype(np.float64), 0.0)
+        t = float(month_index)
+        trend_sum_t[lulc_valid] += t
+        trend_sum_y[lulc_valid] += y[lulc_valid]
+        trend_sum_ty[lulc_valid] += t * y[lulc_valid]
+        trend_sum_tt[lulc_valid] += t * t
+        trend_n[lulc_valid] += 1
 
-    print("Albedo pixels clipped below 0:", below, "above 1:", above)
+        elapsed = time.time() - start_time
+        log(f"Processed month {month_index + 1} of {len(months)} ({month['year_month']}) -- {elapsed:.1f}s elapsed")
 
+    log(f"Albedo clipping across all months: {total_clipped_below} pixel-months below 0, {total_clipped_above} pixel-months above 1 (of {total_pixels * len(months)} pixel-months total)")
+
+    log("Finalizing mean/min/std for NDVI, NDWI, Albedo ...")
     with np.errstate(invalid="ignore", divide="ignore"):
-        ndvi_mean = ndvi.mean()
-        ndwi_mean = ndwi.mean()
-        albedo_mean = albedo.mean()
+        ndvi_mean = np.where(ndvi_count > 0, ndvi_sum / np.maximum(ndvi_count, 1), np.nan)
+        ndvi_variance = np.where(ndvi_count > 0, ndvi_sumsq / np.maximum(ndvi_count, 1) - ndvi_mean ** 2, np.nan)
+        ndvi_std = np.sqrt(np.maximum(ndvi_variance, 0))
+        ndvi_min_final = np.where(ndvi_count > 0, ndvi_min, np.nan)
 
-        bottom = trend_n * sum_tt - sum_t ** 2
-        trend = np.where(
-            (trend_n >= 3) & (np.abs(bottom) > 1e-9),
-            (trend_n * sum_ty - sum_t * sum_y) / np.where(bottom == 0, np.nan, bottom),
+        ndwi_mean = np.where(ndwi_count > 0, ndwi_sum / np.maximum(ndwi_count, 1), np.nan)
+        ndwi_variance = np.where(ndwi_count > 0, ndwi_sumsq / np.maximum(ndwi_count, 1) - ndwi_mean ** 2, np.nan)
+        ndwi_std = np.sqrt(np.maximum(ndwi_variance, 0))
+
+        albedo_mean = np.where(albedo_count > 0, albedo_sum / np.maximum(albedo_count, 1), np.nan)
+        albedo_variance = np.where(albedo_count > 0, albedo_sumsq / np.maximum(albedo_count, 1) - albedo_mean ** 2, np.nan)
+        albedo_std = np.sqrt(np.maximum(albedo_variance, 0))
+        albedo_min_final = np.where(albedo_count > 0, albedo_min, np.nan)
+
+        built_up_pct_mean = np.where(lulc_valid_count > 0, built_up_count / np.maximum(lulc_valid_count, 1) * 100.0, np.nan)
+        vegetation_pct_mean = np.where(lulc_valid_count > 0, vegetation_count / np.maximum(lulc_valid_count, 1) * 100.0, np.nan)
+        water_pct_mean = np.where(lulc_valid_count > 0, water_count / np.maximum(lulc_valid_count, 1) * 100.0, np.nan)
+
+        trend_denominator = trend_n * trend_sum_tt - trend_sum_t ** 2
+        built_up_pct_trend = np.where(
+            (trend_n >= 3) & (np.abs(trend_denominator) > 1e-9),
+            (trend_n * trend_sum_ty - trend_sum_t * trend_sum_y) / np.where(trend_denominator == 0, np.nan, trend_denominator),
             np.nan,
         )
 
-        all_features = {
-            "ndvi_mean": ndvi_mean, "ndvi_min": ndvi.min(), "ndvi_std": ndvi.std(ndvi_mean),
-            "ndwi_mean": ndwi_mean, "ndwi_std": ndwi.std(ndwi_mean),
-            "albedo_mean": albedo_mean, "albedo_min": albedo.min(), "albedo_std": albedo.std(albedo_mean),
-            "built_up_pct_mean": percent(built_up_count, lulc_count),
-            "vegetation_pct_mean": percent(vegetation_count, lulc_count),
-            "water_pct_mean": percent(water_count, lulc_count),
-            "built_up_pct_trend": trend,
-        }
+    log(f"NDVI mean range: {np.nanmin(ndvi_mean):.3f} to {np.nanmax(ndvi_mean):.3f}")
+    log(f"NDWI mean range: {np.nanmin(ndwi_mean):.3f} to {np.nanmax(ndwi_mean):.3f}")
+    log(f"Albedo mean range: {np.nanmin(albedo_mean):.3f} to {np.nanmax(albedo_mean):.3f}")
+    log(f"Built-up pct mean range: {np.nanmin(built_up_pct_mean):.1f} to {np.nanmax(built_up_pct_mean):.1f}")
 
-    features = {}
-    for name in all_features:
-        features[name] = all_features[name].astype(np.float32)
-        print(name, "from", round(float(np.nanmin(features[name])), 3), "to", round(float(np.nanmax(features[name])), 3))
+    building_density_per_km2 = rasterize_building_density(transform, shape, crs)
+    road_density_km_per_km2 = rasterize_road_density(transform, shape, crs)
 
-    features["building_density_per_km2"] = building_density(transform, shape, crs)
-    features["road_density_km_per_km2"] = road_density(transform, shape, crs)
+    feature_arrays = {
+        "ndvi_mean": ndvi_mean.astype(np.float32), "ndvi_min": ndvi_min_final.astype(np.float32), "ndvi_std": ndvi_std.astype(np.float32),
+        "ndwi_mean": ndwi_mean.astype(np.float32), "ndwi_std": ndwi_std.astype(np.float32),
+        "albedo_mean": albedo_mean.astype(np.float32), "albedo_min": albedo_min_final.astype(np.float32), "albedo_std": albedo_std.astype(np.float32),
+        "built_up_pct_mean": built_up_pct_mean.astype(np.float32), "vegetation_pct_mean": vegetation_pct_mean.astype(np.float32), "water_pct_mean": water_pct_mean.astype(np.float32),
+        "built_up_pct_trend": built_up_pct_trend.astype(np.float32),
+        "building_density_per_km2": building_density_per_km2,
+        "road_density_km_per_km2": road_density_km_per_km2,
+    }
 
-    meta = {"height": height, "width": width, "transform": list(transform)[:6], "crs": str(crs), "n_months": len(months)}
-    if window is not None:
-        return features, meta
     os.makedirs(CACHE_DIR, exist_ok=True)
-    np.savez_compressed(CACHE_PATH, meta_shape=np.array(list(meta.items()), dtype=object), **features)
-    print("Saved the features to", CACHE_PATH)
+    meta = {"height": height, "width": width, "transform": list(transform)[:6], "crs": str(crs), "n_months": len(months)}
+    log(f"Caching feature stack to {FEATURE_STACK_CACHE_PATH} ...")
+    np.savez_compressed(FEATURE_STACK_CACHE_PATH, meta_shape=np.array(list(meta.items()), dtype=object), **feature_arrays)
+    log("Feature stack build complete.")
 
-    return features, meta
+    return feature_arrays, meta

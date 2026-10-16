@@ -4,177 +4,204 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
-from catboost import CatBoostRegressor
+from catboost import CatBoostRegressor, Pool
 
-from app.feature_stack import FEATURE_NAMES, ROOT, build_feature_stack
+from app.feature_stack import FEATURE_NAMES, build_feature_stack, PROJECT_ROOT
 
-MODEL_DIR = os.path.join(ROOT, "backend", "models")
-MODEL_PATH = os.path.join(MODEL_DIR, "heat_vulnerability_native10m.cbm")
-INFO_PATH = os.path.join(MODEL_DIR, "heat_vulnerability_native10m_metadata.npz")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "backend", "models")
+MODEL_PATH = os.path.join(MODELS_DIR, "heat_vulnerability_native10m.cbm")
+MODEL_METADATA_PATH = os.path.join(MODELS_DIR, "heat_vulnerability_native10m_metadata.npz")
 
-CORR_LIMIT = 0.5
-STRUCTURAL = ["built_up_pct_mean", "building_density_per_km2", "road_density_km_per_km2"]
-COOLING = ["ndvi_mean", "ndwi_mean", "albedo_mean"]
+CORRELATION_DOWNWEIGHT_THRESHOLD = 0.5
+STRUCTURAL_COLUMNS = ["built_up_pct_mean", "building_density_per_km2", "road_density_km_per_km2"]
+COOLING_COLUMNS = ["ndvi_mean", "ndwi_mean", "albedo_mean"]
 
-BATCH_SIZE = 500000
-THREADS = 6
+TRAINING_BATCH_SIZE = 500000
+CATBOOST_THREAD_COUNT = 6
+CATBOOST_ITERATIONS_PER_BATCH = 150
+CATBOOST_LEARNING_RATE = 0.05
+CATBOOST_DEPTH = 6
 
-TREES = 150
-RATE = 0.05
-DEPTH = 6
-
-TEST_SIZE = 0.2
-SEED = 42
-
-
-def normalize(arr):
-    low = np.nanmin(arr)
-    high = np.nanmax(arr)
-    if high - low < 1e-9:
-        return np.zeros_like(arr)
-    return (arr - low) / (high - low)
+TEST_SET_FRACTION = 0.2
+RANDOM_STATE = 42
 
 
-def flatten_features(features):
-    print("Making the pixel table...")
-    data = {}
-    for f in FEATURE_NAMES:
-        data[f] = features[f].ravel()
-    df = pd.DataFrame(data)
+def log(msg):
+    print(f"[model] {msg}", flush=True)
 
-    valid = df[["ndvi_mean", "built_up_pct_mean", "albedo_mean"]].notna().all(axis=1)
-    print("Valid pixels:", int(valid.sum()), "of", len(df))
 
-    df = df.loc[valid].reset_index(drop=True)
-    for f in FEATURE_NAMES:
-        df[f] = df[f].fillna(df[f].median())
+def normalize_0_1(array_values):
+    lo = np.nanmin(array_values)
+    hi = np.nanmax(array_values)
+    if hi - lo < 1e-9:
+        return np.zeros_like(array_values)
+    return (array_values - lo) / (hi - lo)
+
+
+def flatten_feature_stack_to_dataframe(feature_arrays):
+    log("Flattening the native-10m feature stack to a per-pixel table ...")
+    flat = {name: feature_arrays[name].ravel() for name in FEATURE_NAMES}
+    df = pd.DataFrame(flat)
+
+    valid_mask = df[["ndvi_mean", "built_up_pct_mean", "albedo_mean"]].notna().all(axis=1)
+    log(f"Valid pixels (real NDVI and LULC data present): {int(valid_mask.sum())} of {len(df)} total ({valid_mask.sum()/len(df)*100:.1f}%)")
+
+    df = df.loc[valid_mask].reset_index(drop=True)
+    for col in FEATURE_NAMES:
+        df[col] = df[col].fillna(df[col].median())
+
     return df
 
 
-def avg_correlation(corr, cols):
-    n = len(cols)
-    small = corr.loc[cols, cols]
-    total = np.abs(small.values).sum() - n
-    return total / (n * (n - 1))
+def mean_pairwise_abs_correlation(corr_matrix, columns):
+    n = len(columns)
+    sub = corr_matrix.loc[columns, columns]
+    total_abs_off_diagonal = np.abs(sub.values).sum() - n
+    return total_abs_off_diagonal / (n * (n - 1))
 
 
-def get_weights(df):
-    print("Finding the correlations...")
-    corr = df[STRUCTURAL + COOLING].corr()
-    print(corr.round(3).to_string())
+def compute_correlations_and_weights(df):
+    log("Computing the fresh correlation matrix at native 10m pixel resolution (not assumed from any zonal run) ...")
+    corr_cols = STRUCTURAL_COLUMNS + COOLING_COLUMNS
+    corr_matrix = df[corr_cols].corr()
+    log("Real native-10m correlation matrix:")
+    log("\n" + corr_matrix.round(3).to_string())
 
-    struct_corr = avg_correlation(corr, STRUCTURAL)
-    cooling_corr = avg_correlation(corr, COOLING)
-    print("Structural correlation:", round(struct_corr, 3), "Cooling correlation:", round(cooling_corr, 3))
+    mean_struct_corr = mean_pairwise_abs_correlation(corr_matrix, STRUCTURAL_COLUMNS)
+    mean_cooling_corr = mean_pairwise_abs_correlation(corr_matrix, COOLING_COLUMNS)
 
-    struct_weight = 1.0 / len(STRUCTURAL)
-    if struct_corr > CORR_LIMIT:
-        struct_weight = 0.5 / len(STRUCTURAL)
+    log(f"Mean pairwise |correlation| among structural variables at native 10m: {mean_struct_corr:.3f} (threshold {CORRELATION_DOWNWEIGHT_THRESHOLD})")
+    log(f"Mean pairwise |correlation| among cooling variables (NDVI, NDWI, albedo) at native 10m: {mean_cooling_corr:.3f}")
 
-    cooling_weight = 1.0 / len(COOLING)
-    if cooling_corr > CORR_LIMIT:
-        cooling_weight = 0.5 / len(COOLING)
+    n_struct = len(STRUCTURAL_COLUMNS)
+    n_cooling = len(COOLING_COLUMNS)
+    struct_weight_each = (0.5 / n_struct) if mean_struct_corr > CORRELATION_DOWNWEIGHT_THRESHOLD else (1.0 / n_struct)
+    cooling_weight_each = (0.5 / n_cooling) if mean_cooling_corr > CORRELATION_DOWNWEIGHT_THRESHOLD else (1.0 / n_cooling)
+
+    if mean_struct_corr > CORRELATION_DOWNWEIGHT_THRESHOLD:
+        log(f"Structural variables are correlated -> down-weighted to a combined 0.5 (each gets {struct_weight_each:.3f})")
+    else:
+        log(f"Structural variables are not strongly correlated -> each gets close to full weight ({struct_weight_each:.3f})")
+
+    if mean_cooling_corr > CORRELATION_DOWNWEIGHT_THRESHOLD:
+        log(f"Cooling variables (NDVI/NDWI/albedo) are correlated -> down-weighted to a combined 0.5 (each gets {cooling_weight_each:.3f})")
+    else:
+        log(f"Cooling variables are not strongly correlated -> each gets close to full weight ({cooling_weight_each:.3f})")
 
     weights = {
-        "built_up_pct_mean": struct_weight,
-        "building_density_per_km2": struct_weight,
-        "road_density_km_per_km2": struct_weight,
-        "ndvi_mean": -cooling_weight,
-        "ndwi_mean": -cooling_weight,
-        "albedo_mean": -cooling_weight,
+        "built_up_pct_mean": struct_weight_each,
+        "building_density_per_km2": struct_weight_each,
+        "road_density_km_per_km2": struct_weight_each,
+        "ndvi_mean": -cooling_weight_each,
+        "ndwi_mean": -cooling_weight_each,
+        "albedo_mean": -cooling_weight_each,
     }
-    print("Weights:", weights)
-    return weights, corr, struct_corr, cooling_corr
+    log(f"Final weights at native 10m: {weights}")
+
+    return weights, corr_matrix, mean_struct_corr, mean_cooling_corr
 
 
-def make_index(df, weights):
-    total = 0
-    for col in weights:
-        total = total + normalize(df[col].values) * weights[col]
-    total = pd.Series(total)
-    total = total - total.min()
-    return total / total.max() * 100.0
+def build_heat_vulnerability_index(df, weights):
+    normalized = pd.DataFrame({col: normalize_0_1(df[col].values) for col in weights.keys()})
+    raw_index = sum(normalized[col] * weight for col, weight in weights.items())
+    raw_index = raw_index - raw_index.min()
+    raw_index = raw_index / raw_index.max() * 100.0
+    return raw_index
 
 
-def train_in_batches(x_train, y_train):
-    print("Training on", len(x_train), "pixels...")
-    batches = int(np.ceil(len(x_train) / BATCH_SIZE))
+def train_catboost_in_batches(X_train, y_train):
+    log(f"Training CatBoost on {len(X_train)} real pixels in batches of {TRAINING_BATCH_SIZE} (thread_count={CATBOOST_THREAD_COUNT} of the machine's available cores, to avoid pinning the CPU) ...")
+
+    n_batches = int(np.ceil(len(X_train) / TRAINING_BATCH_SIZE))
     model = None
-    start = time.time()
+    start_time = time.time()
 
-    for b in range(batches):
-        first = b * BATCH_SIZE
-        last = min(first + BATCH_SIZE, len(x_train))
+    for batch_index in range(n_batches):
+        batch_start = batch_index * TRAINING_BATCH_SIZE
+        batch_end = min(batch_start + TRAINING_BATCH_SIZE, len(X_train))
+        X_batch = X_train.iloc[batch_start:batch_end]
+        y_batch = y_train.iloc[batch_start:batch_end]
 
         new_model = CatBoostRegressor(
-            iterations=TREES,
-            learning_rate=RATE,
-            depth=DEPTH,
+            iterations=CATBOOST_ITERATIONS_PER_BATCH,
+            learning_rate=CATBOOST_LEARNING_RATE,
+            depth=CATBOOST_DEPTH,
             loss_function="RMSE",
-            thread_count=THREADS,
+            thread_count=CATBOOST_THREAD_COUNT,
             verbose=False,
-            random_state=SEED,
+            random_state=RANDOM_STATE,
         )
-        if model is None:
-            new_model.fit(x_train.iloc[first:last], y_train.iloc[first:last])
-        else:
-            new_model.fit(x_train.iloc[first:last], y_train.iloc[first:last], init_model=model)
-        model = new_model
 
-        print("Batch", b + 1, "of", batches, "done,", round(time.time() - start, 1), "seconds")
+        if model is None:
+            new_model.fit(X_batch, y_batch)
+        else:
+            new_model.fit(X_batch, y_batch, init_model=model)
+
+        model = new_model
+        elapsed = time.time() - start_time
+        log(f"Batch {batch_index + 1} of {n_batches} done ({batch_end - batch_start} rows) -- {elapsed:.1f}s elapsed total")
+
     return model
 
 
-def train_model(rebuild=False):
-    features, meta = build_feature_stack(rebuild)
-    df = flatten_features(features)
+def train_native_10m_model(force_rebuild_features=False):
+    log("=====================================================")
+    log("TRAINING NATIVE-10m HEAT VULNERABILITY MODEL (full-pixel, batched)")
+    log("=====================================================")
 
-    weights, corr, struct_corr, cooling_corr = get_weights(df)
-    df["heat_vulnerability_index"] = make_index(df, weights)
+    feature_arrays, meta = build_feature_stack(force_rebuild=force_rebuild_features)
+    df = flatten_feature_stack_to_dataframe(feature_arrays)
 
-    x = df[FEATURE_NAMES]
+    weights, corr_matrix, mean_struct_corr, mean_cooling_corr = compute_correlations_and_weights(df)
+    df["heat_vulnerability_index"] = build_heat_vulnerability_index(df, weights)
+
+    X = df[FEATURE_NAMES]
     y = df["heat_vulnerability_index"]
-    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=TEST_SIZE, random_state=SEED)
-    print("Train:", len(x_train), "Test:", len(x_test))
 
-    model = train_in_batches(x_train, y_train)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SET_FRACTION, random_state=RANDOM_STATE)
+    log(f"Train size: {len(X_train)}, test size: {len(X_test)}")
 
-    predicted = model.predict(x_test)
-    r2 = r2_score(y_test, predicted)
-    mae = mean_absolute_error(y_test, predicted)
-    print("R2:", round(r2, 4), "MAE:", round(mae, 4))
+    model = train_catboost_in_batches(X_train, y_train)
 
-    importance = pd.DataFrame({"feature": FEATURE_NAMES, "importance": model.get_feature_importance()})
-    importance = importance.sort_values("importance", ascending=False)
-    print(importance.to_string(index=False))
+    predictions = model.predict(X_test)
+    r_squared = r2_score(y_test, predictions)
+    mean_absolute_err = mean_absolute_error(y_test, predictions)
+    log(f"Held-out test R-squared: {r_squared:.4f}")
+    log(f"Held-out test MAE: {mean_absolute_err:.4f} (index scaled 0-100)")
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    importances = model.get_feature_importance()
+    importance_df = pd.DataFrame({"feature": FEATURE_NAMES, "importance": importances}).sort_values("importance", ascending=False)
+    log("Feature importance:\n" + importance_df.to_string(index=False))
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
     model.save_model(MODEL_PATH)
+    log(f"Saved model artifact to {MODEL_PATH}")
 
-    info = {
-        "r_squared": r2,
-        "mae": mae,
-        "n_train": len(x_train),
-        "n_test": len(x_test),
+    metadata = {
+        "r_squared": r_squared,
+        "mae": mean_absolute_err,
+        "n_train": len(X_train),
+        "n_test": len(X_test),
         "weights": weights,
-        "mean_struct_corr": struct_corr,
-        "mean_cooling_corr": cooling_corr,
+        "mean_struct_corr": mean_struct_corr,
+        "mean_cooling_corr": mean_cooling_corr,
         "feature_names": FEATURE_NAMES,
-        "importance": importance.to_dict(orient="records"),
+        "importance": importance_df.to_dict(orient="records"),
         "self_consistency_caveat": (
             "The target is a deterministic formula built from features this model also trains on. "
             "A high R-squared confirms correct formula reconstruction, not external predictive skill on unseen ground truth."
         ),
     }
-    np.savez(INFO_PATH, metadata=np.array([info], dtype=object))
-    print("Saved the model and info")
-    return model, info
+    np.savez(MODEL_METADATA_PATH, metadata=np.array([metadata], dtype=object))
+    log(f"Saved model metadata to {MODEL_METADATA_PATH}")
+
+    return model, metadata
 
 
-def load_model():
+def load_trained_model():
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError("No model found at " + MODEL_PATH + ", run train_model() first")
+        raise FileNotFoundError(f"No trained model found at {MODEL_PATH}. Run train_native_10m_model() first.")
     model = CatBoostRegressor()
     model.load_model(MODEL_PATH)
-    info = np.load(INFO_PATH, allow_pickle=True)["metadata"][0]
-    return model, info
+    metadata = np.load(MODEL_METADATA_PATH, allow_pickle=True)["metadata"][0]
+    return model, metadata

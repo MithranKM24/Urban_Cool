@@ -1,4 +1,6 @@
 fastapi
+uvicorn
+pydantic
 numpy
 pandas
 scipy
@@ -7,3 +9,4 @@ geopandas
 shapely
 scikit-learn
 catboost
+shap
