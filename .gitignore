@@ -1,3 +1,9 @@
 /data/
 **/__pycache__/
 *.py[cod]
+node_modules/
+.next/
+*.tsbuildinfo
+.run-logs/
+.claude/
+backend/cache/
